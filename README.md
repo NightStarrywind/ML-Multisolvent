@@ -1,1 +1,2 @@
 # ML-Multisolvent
+Three ensemble learning algorithms were employed to establish quantitative relationships between chemical compositions and oxidative potential indicators: Random Forest (RF), eXtreme Gradient Boosting (XGBoost), and Light Gradient Boosting Machine (LightGBM). Chemical species concentrations served as independent variables, while DTTm, SOD, or MDA were used as dependent variables.
