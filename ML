@@ -1,0 +1,596 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.utils import resample
+import xgboost as xgb
+import lightgbm as lgb
+import shap
+import warnings
+import os
+
+warnings.filterwarnings('ignore')
+
+# 设置全局随机种子
+SEED = 42
+np.random.seed(SEED)
+import random
+
+random.seed(SEED)
+
+# 设置中文显示和图形样式
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+sns.set_style("whitegrid")
+
+# 设置环境变量，避免并行处理时的编码问题
+os.environ['LOKY_MAX_CPU_COUNT'] = '4'
+os.environ['PYTHONHASHSEED'] = str(SEED)
+
+
+# 定义特征名称显示映射（上下标）
+def create_feature_display_map(feature_names):
+    """创建特征名称显示映射，将化学符号转换为带有上下标的格式"""
+    display_map = {}
+
+    # 定义常见的化学符号映射
+    chemical_symbols = {
+        # 阳离子
+        "Na+": r"Na$^{+}$",
+        "NH4+": r"NH$_4$$^{+}$",
+        "K+": r"K$^{+}$",
+        "Mg2+": r"Mg$^{2+}$",
+        "Ca2+": r"Ca$^{2+}$",
+        # 阴离子
+        "Cl-": r"Cl$^{-}$",
+        "NO3-": r"NO$_3$$^{-}$",
+        "SO42-": r"SO$_4$$^{2-}$",
+        # 元素
+        "Al ": r"Al",
+        "Si ": r"Si",
+        "Ti ": r"Ti",
+        "V ": r"V",
+        "Cr ": r"Cr",
+        "Mn ": r"Mn",
+        "Fe ": r"Fe",
+        "Ni ": r"Ni",
+        "Cu ": r"Cu",
+        "Zn": r"Zn",
+        "As ": r"As",
+        "Pb ": r"Pb",
+        "Se": r"Se",
+        # 有机化合物类别
+        "Urea": r"Urea",
+        "UCM": r"UCM",
+        "oPAHs": r"oPAHs",
+        "pPAHs": r"pPAHs",
+        "nPAHs ": r"nPAHs",
+        "Alkanes": r"Alkanes",
+        "Hopanes": r"Hopanes",
+        "Steranes": r"Steranes",
+        "Methyl-alkane": r"Methyl-alkane",
+        "Branched-alkane": r"Branched-alkane",
+        "Cycloalkane": r"Cycloalkane",
+        "Alkenes": r"Alkenes",
+        "Phthalates": r"Phthalates",
+        "Monosaccaharide anhydrates ": r"Monosaccharide anhydrates",
+        "Phthalic acid and Derivatives": r"Phthalic acid and Derivatives",
+        "Mono-, di-, and polysaccharide": r"Mono-, di-, and polysaccharide",
+        "Alkanoic acids": r"Alkanoic acids",
+        "Alkenoic acids": r"Alkenoic acids",
+        "Dicarboxylic acids": r"Dicarboxylic acids",
+        "Aromatic acids": r"Aromatic acids",
+        "Sugars": r"Sugars",
+        "Alkanols": r"Alkanols",
+        "Aliphatic and aromatic amines": r"Aliphatic and aromatic amines",
+        "Cyclic NOCs and alkyl amides": r"Cyclic NOCs and alkyl amides",
+        "Nitrile": r"Nitrile",
+        "Iscocyanate": r"Isocyanate",
+    }
+
+    # 为每个特征创建显示名称
+    for feature in feature_names:
+        # 去除可能的前后空格
+        feature_clean = feature.strip()
+
+        # 检查是否在预定义映射中
+        if feature_clean in chemical_symbols:
+            display_map[feature] = chemical_symbols[feature_clean]
+        else:
+            # 如果不在预定义映射中，尝试处理常见的化学符号格式
+            if feature_clean.endswith('+') or feature_clean.endswith('-'):
+                # 处理带电荷的离子
+                if feature_clean[-2:].isdigit():
+                    # 例如: "Mg2+"
+                    element = feature_clean[:-2]
+                    charge = feature_clean[-2:]
+                    if charge[0].isdigit() and charge[1] in ['+', '-']:
+                        display_map[feature] = f"{element}$^{{{charge[0]}{charge[1]}}}$"
+                    else:
+                        display_map[feature] = feature_clean
+                else:
+                    # 例如: "Na+"
+                    element = feature_clean[:-1]
+                    charge = feature_clean[-1]
+                    display_map[feature] = f"{element}$^{{{charge}}}$"
+            elif any(char.isdigit() for char in feature_clean):
+                # 处理包含数字的化学式
+                display_map[feature] = feature_clean
+            else:
+                # 其他情况保持原样
+                display_map[feature] = feature_clean
+
+    return display_map
+
+
+def create_output_folder(target_column, base_folder=None):
+    """创建输出文件夹"""
+    if base_folder is None:
+        # 默认在当前目录下创建output文件夹
+        base_folder = os.path.join(os.getcwd(), 'output')
+
+    # 创建以目标变量命名的子文件夹
+    output_folder = os.path.join(base_folder, f'{target_column}_analysis')
+
+    # 如果文件夹不存在，则创建
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder, exist_ok=True)
+        print(f"创建输出文件夹: {output_folder}")
+
+    return output_folder
+
+
+def calculate_metrics(y_true, y_pred):
+    """计算评估指标"""
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+
+    # 避免除零错误，计算MAPE
+    mask = y_true != 0
+    if np.sum(mask) > 0:
+        mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+    else:
+        mape = np.nan
+
+    r2 = r2_score(y_true, y_pred)
+
+    return {
+        'RMSE': rmse,
+        'MAE': mae,
+        'MAPE': mape,
+        'R²': r2
+    }
+
+
+def data_augmentation(X, y, n_samples=5, noise_level=0.02, seed=SEED):
+    """数据增强：通过添加噪声和重采样增加数据"""
+    X_augmented = []
+    y_augmented = []
+
+    # 创建本地随机状态，避免影响全局
+    rng = np.random.RandomState(seed)
+
+    for i in range(n_samples):
+        # 使用不同的种子确保每次运行结果一致
+        current_seed = seed + i
+        local_rng = np.random.RandomState(current_seed)
+
+        # 重采样
+        idx = local_rng.choice(len(X), len(X), replace=True)
+        X_resampled = X[idx].copy()
+        y_resampled = y[idx].copy()
+
+        # 添加高斯噪声
+        if len(X_resampled) > 0:
+            noise = local_rng.normal(0, noise_level, X_resampled.shape)
+            X_resampled = X_resampled + noise * X_resampled.std(axis=0)
+
+        X_augmented.append(X_resampled)
+        y_augmented.append(y_resampled)
+
+    if X_augmented:
+        X_aug = np.vstack(X_augmented)
+        y_aug = np.concatenate(y_augmented)
+
+        # 合并原始数据
+        X_combined = np.vstack([X, X_aug])
+        y_combined = np.concatenate([y, y_aug])
+    else:
+        X_combined, y_combined = X, y
+
+    return X_combined, y_combined
+
+
+def analyze_dataset(file_path, target_column, output_folder=None, seed=SEED):
+    """分析单个数据集"""
+    print(f"\n{'=' * 60}")
+    print(f"正在分析数据集")
+    print(f"文件路径: {file_path}")
+    print(f"目标变量: {target_column}")
+    print(f"随机种子: {seed}")
+    print(f"{'=' * 60}")
+
+    # 创建输出文件夹
+    output_dir = create_output_folder(target_column, output_folder)
+
+    # 读取数据
+    try:
+        df = pd.read_excel(file_path)
+        print(f"数据形状: {df.shape}")
+        print(f"数据列名: {list(df.columns)}")
+    except Exception as e:
+        print(f"读取文件失败: {str(e)}")
+        return None, None, None
+
+    # 检查目标列是否存在
+    if target_column not in df.columns:
+        print(f"错误: 目标列 '{target_column}' 不在数据中")
+        print(f"可用的列: {list(df.columns)}")
+        return None, None, None
+
+    # 分离特征和目标
+    X = df.drop(columns=[target_column])
+    y = df[target_column].values
+    feature_names = X.columns.tolist()
+
+    # 创建特征显示名称映射
+    feature_display_map = create_feature_display_map(feature_names)
+    feature_labels = [feature_display_map[feature] for feature in feature_names]
+
+    print(f"特征数量: {len(feature_names)}")
+    print(f"样本数量: {len(y)}")
+    print(f"目标变量统计 - 均值: {y.mean():.4f}, 标准差: {y.std():.4f}")
+
+    # 数据标准化
+    scaler = RobustScaler()  # 使用RobustScaler对异常值更稳健
+    X_scaled = scaler.fit_transform(X)
+
+    # 数据增强（增加样本量）
+    X_augmented, y_augmented = data_augmentation(X_scaled, y, n_samples=5, noise_level=0.02, seed=seed)
+
+    # 划分训练集和测试集
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_augmented, y_augmented, test_size=0.2, random_state=seed
+    )
+
+    print(f"训练集大小: {X_train.shape}, 测试集大小: {X_test.shape}")
+
+    # 初始化模型（关闭并行处理，避免编码问题）
+    models = {
+        'Random Forest': RandomForestRegressor(
+            n_estimators=300,
+            max_depth=10,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            max_features='sqrt',
+            random_state=seed,
+            n_jobs=1  # 改为1，避免并行处理问题
+        ),
+        'XGBoost': xgb.XGBRegressor(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,  # L1正则化
+            reg_lambda=0.1,  # L2正则化
+            random_state=seed,
+            n_jobs=1,  # 改为1，避免并行处理问题
+            enable_categorical=False
+        ),
+        'LightGBM': lgb.LGBMRegressor(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            random_state=seed,
+            n_jobs=1,  # 改为1，避免并行处理问题
+            deterministic=True  # 确保确定性
+        )
+    }
+
+    results = {}
+    feature_importances = {}
+
+    # 训练和评估每个模型
+    for model_name, model in models.items():
+        print(f"\n训练 {model_name}...")
+
+        # 使用交叉验证（不使用并行处理）
+        kf = KFold(n_splits=5, shuffle=True, random_state=seed)
+        try:
+            cv_scores = cross_val_score(model, X_train, y_train,
+                                        cv=kf, scoring='r2', n_jobs=1)  # n_jobs=1
+            print(f"交叉验证R²: {cv_scores.mean():.4f} (±{cv_scores.std():.4f})")
+        except Exception as e:
+            print(f"交叉验证失败: {str(e)}")
+            cv_scores = [0]
+
+        # 训练模型
+        model.fit(X_train, y_train)
+
+        # 预测
+        y_pred = model.predict(X_test)
+
+        # 计算评估指标
+        metrics = calculate_metrics(y_test, y_pred)
+        results[model_name] = metrics
+
+        # 获取特征重要性
+        if hasattr(model, 'feature_importances_'):
+            importances = model.feature_importances_
+        elif hasattr(model, 'coef_'):
+            importances = np.abs(model.coef_)
+        else:
+            importances = np.zeros(len(feature_names))
+
+        # 归一化重要性
+        if importances.sum() > 0:
+            importances = importances / importances.sum()
+        feature_importances[model_name] = dict(zip(feature_names, importances))
+
+        print(f"测试集评估指标:")
+        for metric, value in metrics.items():
+            print(f"  {metric}: {value:.4f}")
+
+
+
+
+
+    # 1. 绘制特征重要性条形图（使用原始特征名）
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    fig.suptitle(f'{target_column} - 特征重要性比较 (种子={seed})', fontsize=16, fontweight='bold')
+
+    for idx, (model_name, importances_dict) in enumerate(feature_importances.items()):
+        # 排序并取前15个最重要的特征
+        sorted_features = sorted(importances_dict.items(), key=lambda x: x[1], reverse=True)[:15]
+        features = [feature_display_map.get(f[0], f[0]) for f in sorted_features]  # 使用显示名
+        importance_vals = [f[1] for f in sorted_features]
+
+        ax = axes[idx]
+        bars = ax.barh(range(len(features)), importance_vals)
+        ax.set_yticks(range(len(features)))
+        ax.set_yticklabels(features, fontsize=8)
+        ax.set_xlabel('重要性')
+        ax.set_title(f'{model_name}')
+        ax.invert_yaxis()
+
+        # 添加数值标签
+        for bar in bars:
+            width = bar.get_width()
+            ax.text(width, bar.get_y() + bar.get_height() / 2,
+                    f'{width:.3f}', ha='left', va='center', fontsize=8)
+
+    plt.tight_layout()
+    output_filename = os.path.join(output_dir, f'{target_column}_feature_importance.png')
+    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+    plt.close(fig)  # 关闭图形，不显示
+    print(f"特征重要性图已保存: {output_filename}")
+
+
+
+
+    # 2. 绘制SHAP图（以随机森林为例）
+    print("\n计算SHAP值...")
+    rf_model = models['Random Forest']
+
+    try:
+        # 计算SHAP值
+        explainer = shap.TreeExplainer(rf_model)
+        shap_values = explainer.shap_values(X_train)
+
+        # 绘制SHAP摘要图 - 移除网格线，使用显示名
+        plt.figure(figsize=(12, 8))
+        shap.summary_plot(shap_values, X_train, feature_names=feature_labels,  # 使用显示名
+                          show=False, max_display=15, plot_size=None)
+        # 获取当前图形并移除网格
+        ax = plt.gca()
+        ax.grid(False)  # 移除网格线
+
+        plt.tight_layout()
+        output_filename = os.path.join(output_dir, f'{target_column}_shap_summary.png')
+        plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+        plt.close()  # 关闭图形，不显示
+        print(f"SHAP摘要图已保存: {output_filename}")
+
+        # 绘制特定特征的SHAP依赖图（选择最重要的特征）- 移除网格线，使用显示名
+        if len(feature_names) > 0:
+            # 获取最重要的特征（使用原始特征名）
+            top_features = sorted(feature_importances['Random Forest'].items(),
+                                  key=lambda x: x[1], reverse=True)[:3]
+
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+            fig.suptitle(f'{target_column} - Top 3 特征的SHAP依赖图 (种子={seed})', fontsize=14)
+
+            for idx, (feature, _) in enumerate(top_features):
+                if feature in feature_names:
+                    feature_idx = feature_names.index(feature)
+                    shap.dependence_plot(feature_idx, shap_values, X_train,
+                                         feature_names=feature_labels,  # 使用显示名
+                                         ax=axes[idx], show=False)
+                    axes[idx].set_title(f'Feature: {feature_labels[feature_idx]}', fontsize=10)  # 使用显示名
+                    axes[idx].grid(False)  # 移除网格线
+
+            plt.tight_layout()
+            output_filename = os.path.join(output_dir, f'{target_column}_shap_dependence.png')
+            plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+            plt.close(fig)  # 关闭图形，不显示
+            print(f"SHAP依赖图已保存: {output_filename}")
+    except Exception as e:
+        print(f"SHAP计算失败: {str(e)}")
+
+    # 3. 绘制模型评估指标对比图
+    metrics_df = pd.DataFrame(results).T
+    metrics_to_plot = ['R²', 'RMSE', 'MAPE']
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(f'{target_column} - 模型性能对比 (种子={seed})', fontsize=16, fontweight='bold')
+
+    for idx, metric in enumerate(metrics_to_plot):
+        if metric in metrics_df.columns:
+            ax = axes[idx]
+            bars = ax.bar(metrics_df.index, metrics_df[metric])
+            ax.set_ylabel(metric)
+            ax.set_title(f'{metric} 对比')
+            ax.set_xticklabels(metrics_df.index, rotation=45, ha='right')
+
+            # 添加数值标签
+            for bar in bars:
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width() / 2, height,
+                        f'{height:.3f}', ha='center', va='bottom')
+
+            # 为R²添加参考线
+            if metric == 'R²':
+                ax.axhline(y=0.7, color='r', linestyle='--', alpha=0.5, label='R²=0.7')
+                ax.axhline(y=0.8, color='g', linestyle='--', alpha=0.5, label='R²=0.8')
+                ax.legend()
+
+    plt.tight_layout()
+    output_filename = os.path.join(output_dir, f'{target_column}_model_comparison.png')
+    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+    plt.close(fig)  # 关闭图形，不显示
+    print(f"模型对比图已保存: {output_filename}")
+
+    # 4. 绘制预测值与真实值的散点图
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(f'{target_column} - 预测值与真实值对比 (种子={seed})', fontsize=16, fontweight='bold')
+
+    for idx, model_name in enumerate(models.keys()):
+        model = models[model_name]
+        y_pred = model.predict(X_test)
+
+        ax = axes[idx]
+        ax.scatter(y_test, y_pred, alpha=0.6, edgecolors='k', linewidth=0.5)
+
+        # 添加对角线
+        min_val = min(y_test.min(), y_pred.min())
+        max_val = max(y_test.max(), y_pred.max())
+        ax.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8)
+
+        ax.set_xlabel('真实值')
+        ax.set_ylabel('预测值')
+        ax.set_title(f'{model_name} (R² = {results[model_name]["R²"]:.3f})')
+        ax.grid(True, alpha=0.3)
+
+        # 添加R²文本
+        ax.text(0.05, 0.95, f'R² = {results[model_name]["R²"]:.3f}',
+                transform=ax.transAxes, fontsize=12,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout()
+    output_filename = os.path.join(output_dir, f'{target_column}_predictions_vs_actual.png')
+    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+    plt.close(fig)  # 关闭图形，不显示
+    print(f"预测值对比图已保存: {output_filename}")
+
+    # 5. 保存结果到Excel
+    try:
+        # 保存特征重要性（同时保存原始名和显示名）
+        importance_df = pd.DataFrame(feature_importances)
+        importance_df = importance_df.sort_values(by='Random Forest', ascending=False)
+
+        # 添加显示名列
+        importance_df['显示名称'] = [feature_display_map.get(idx, idx) for idx in importance_df.index]
+
+        # 保存评估指标
+        metrics_df = pd.DataFrame(results).T
+
+        # 保存预测结果
+        predictions = {}
+        for model_name, model in models.items():
+            predictions[f'{model_name}_预测值'] = model.predict(X_test)
+
+        predictions_df = pd.DataFrame(predictions)
+        predictions_df['真实值'] = y_test
+
+        # 保存训练集特征用于后续分析
+        train_features_df = pd.DataFrame(X_train, columns=feature_names)
+        train_features_df[target_column] = y_train
+
+        # 使用ExcelWriter保存多个sheet
+        output_excel = os.path.join(output_dir, f'{target_column}_分析结果_种子{seed}.xlsx')
+        with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+            metrics_df.to_excel(writer, sheet_name='评估指标')
+            importance_df.to_excel(writer, sheet_name='特征重要性')
+            predictions_df.to_excel(writer, sheet_name='预测结果')
+            train_features_df.to_excel(writer, sheet_name='训练集数据')
+
+            # 保存模型参数
+            params_df = pd.DataFrame({
+                '模型': list(models.keys()),
+                '参数': [str(model.get_params()) for model in models.values()]
+            })
+            params_df.to_excel(writer, sheet_name='模型参数')
+
+            # 保存特征名称映射
+            feature_mapping_df = pd.DataFrame({
+                '原始特征名': feature_names,
+                '显示特征名': feature_labels
+            })
+            feature_mapping_df.to_excel(writer, sheet_name='特征名称映射', index=False)
+
+            # 保存随机种子信息
+            seed_info = pd.DataFrame({
+                '参数': ['随机种子', '数据增强样本数', '噪声水平'],
+                '值': [seed, 5, 0.02]
+            })
+            seed_info.to_excel(writer, sheet_name='随机参数', index=False)
+
+        print(f"\n结果已保存到: {output_excel}")
+    except Exception as e:
+        print(f"保存结果失败: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+    return results, feature_importances, output_dir
+
+
+def main():
+    """主函数：分析指定文件和目标列"""
+    # 设置文件路径和目标列
+    FILE = r"D:\AAA\ROS\2\SOD insolH.xlsx"
+    TARGET_COL = "SOD"
+
+    # 设置随机种子
+    SEED = 42  # 可以修改这个值来得到不同的随机结果
+
+    # 可选：指定自定义输出文件夹路径
+    # OUTPUT_FOLDER = r"D:\PyCharm 2024.2.3\pythonProject\SmallData\output"
+    OUTPUT_FOLDER = r"D:\AAA\results"  # 设置为None则使用默认路径
+
+    # 分析数据集
+    results, feature_importances, output_dir = analyze_dataset(FILE, TARGET_COL, OUTPUT_FOLDER, SEED)
+
+    if results:
+        print(f"\n{'=' * 60}")
+        print("分析完成！")
+        print(f"随机种子: {SEED}")
+        print(f"所有输出文件已保存到: {output_dir}")
+        print(f"{'=' * 60}")
+
+        # 打印最佳模型
+        best_model = max(results.items(), key=lambda x: x[1]['R²'])
+        print(f"\n最佳模型: {best_model[0]}")
+        print(f"R²: {best_model[1]['R²']:.4f}")
+        print(f"RMSE: {best_model[1]['RMSE']:.4f}")
+
+        # 打印最重要的特征
+        print(f"\n最重要的特征 (Random Forest):")
+        rf_importances = sorted(feature_importances['Random Forest'].items(),
+                                key=lambda x: x[1], reverse=True)[:5]
+        for feature, importance in rf_importances:
+            print(f"  {feature}: {importance:.4f}")
+
+
+if __name__ == "__main__":
+    main()
